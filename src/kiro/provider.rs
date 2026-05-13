@@ -457,6 +457,8 @@ impl KiroProvider {
             }
 
             if status.as_u16() == 429 {
+                // MODEL_TEMPORARILY_UNAVAILABLE：保留 5min 全局熔断（严重错误，可
+                // 能是上游模型整体下线）。
                 if Self::is_model_temporarily_unavailable(&body)
                     && self.token_manager.report_model_unavailable()
                 {
@@ -467,11 +469,18 @@ impl KiroProvider {
                     );
                 }
 
-                let cooldown = self.handle_rate_limited_response(ctx.id, &body, retry_after);
+                // 折中策略（Round 8 决议）：平台不在凭据级做 429 限流，仅在本轮
+                // 请求里切下个凭据 retry。
+                //   - 不冻凭据（不调 handle_rate_limited_response）
+                //   - 不累计 trigger_count（避免 60→90→135s 指数雪球）
+                //   - 让上游自己做限流；本轮请求耗尽 MAX_TOTAL_RETRIES 后透传 429
+                //   - INSUFFICIENT_MODEL_CAPACITY（region capacity 池容量不足）走
+                //     同一路径 —— 跟凭据无关，切凭据也帮不了，但不主动惩罚账号
+                let retry_secs = retry_after.map(|d| d.as_secs()).unwrap_or(0);
                 tracing::warn!(
                     credential_id = %ctx.id,
-                    cooldown_secs = %cooldown.as_secs(),
-                    "MCP 请求触发 429，当前凭据进入冷却并尝试切换其他凭据"
+                    retry_after_secs = retry_secs,
+                    "MCP 请求触发 429，不冻凭据，切下个凭据 retry"
                 );
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                 continue;
@@ -789,6 +798,7 @@ impl KiroProvider {
             }
 
             if status.as_u16() == 429 {
+                // MODEL_TEMPORARILY_UNAVAILABLE：保留 5min 全局熔断
                 if Self::is_model_temporarily_unavailable(&body)
                     && self.token_manager.report_model_unavailable()
                 {
@@ -800,11 +810,13 @@ impl KiroProvider {
                     );
                 }
 
-                let cooldown = self.handle_rate_limited_response(ctx.id, &body, retry_after);
+                // 折中策略（Round 8 决议）：429 不冻凭据，切下个凭据 retry。
+                // 详见 MCP 同路径注释（line ~459）。
+                let retry_secs = retry_after.map(|d| d.as_secs()).unwrap_or(0);
                 tracing::warn!(
                     credential_id = %ctx.id,
-                    cooldown_secs = %cooldown.as_secs(),
-                    "{} API 请求触发 429，当前凭据进入冷却并尝试切换其他凭据",
+                    retry_after_secs = retry_secs,
+                    "{} API 请求触发 429，不冻凭据，切下个凭据 retry",
                     api_type
                 );
                 last_error = Some(anyhow::anyhow!(
@@ -895,6 +907,14 @@ impl KiroProvider {
         Duration::from_millis(backoff.saturating_add(jitter))
     }
 
+    /// 把当前凭据放入 RateLimitExceeded 冷却（trigger_count 指数退避）。
+    ///
+    /// **Round 8 决议后保留但默认不调用** —— 平台不再在 429 路径冻凭据
+    /// （详见 4 个 429 分支的注释）。函数保留以便：
+    ///   a) 未来如果需要按 model 或按 reason 选择性冻凭据，可重新接入
+    ///   b) token_manager.set_credential_cooldown_with_duration 仍由 401/403
+    ///      / TokenRefreshFailed 等"凭据真坏"路径使用
+    #[allow(dead_code)]
     fn handle_rate_limited_response(
         &self,
         credential_id: u64,
@@ -943,6 +963,9 @@ impl KiroProvider {
         )
     }
 
+    /// 检测响应体是否为 rate-limit 类错误。Round 8 决议后默认不接入，参见
+    /// `handle_rate_limited_response` 的 `#[allow(dead_code)]` 注释。
+    #[allow(dead_code)]
     fn is_rate_limit_response(body: &str) -> bool {
         let lower = body.to_ascii_lowercase();
         if lower.contains("rate limit")
