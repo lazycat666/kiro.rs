@@ -3810,23 +3810,41 @@ mod tests {
         );
     }
 
+    /// Round 7 corrected: this test used to assert `api_host` used config.region
+    /// even when credentials had its own region — but it only did a local
+    /// `format!()`, never invoked `effective_api_region` / `host()`. The actual
+    /// code uses **credentials.region first, falling back to config**. This
+    /// test now exercises the real `effective_api_region` to lock in that
+    /// behavior.
     #[test]
-    fn test_api_call_still_uses_config_region() {
-        // 验证 API 调用（如 getUsageLimits）仍使用 config.region
-        // 这确保只有 OIDC 刷新使用凭据 region，API 调用行为不变
+    fn test_api_call_uses_credentials_region_when_set() {
         let mut config = Config::default();
         config.region = "us-west-2".to_string();
 
         let mut credentials = KiroCredentials::default();
         credentials.region = Some("eu-west-1".to_string());
 
-        // API 调用应使用 config.region，而非 credentials.region
-        let api_region = &config.region;
-        let api_host = format!("q.{}.amazonaws.com", api_region);
+        // The real production behavior: credentials.region wins.
+        let api_region = credentials.effective_api_region(&config);
+        assert_eq!(
+            api_region, "eu-west-1",
+            "credentials.region must take precedence over config.region"
+        );
 
-        assert_eq!(api_host, "q.us-west-2.amazonaws.com");
-        // 确认凭据 region 不影响 API 调用
-        assert_ne!(api_region, credentials.region.as_ref().unwrap());
+        let api_host = format!("q.{}.amazonaws.com", api_region);
+        assert_eq!(api_host, "q.eu-west-1.amazonaws.com");
+    }
+
+    /// Mirror: when credentials.region is None, falls back to config.region.
+    #[test]
+    fn test_api_call_falls_back_to_config_region() {
+        let mut config = Config::default();
+        config.region = "us-west-2".to_string();
+
+        let credentials = KiroCredentials::default(); // region: None
+
+        let api_region = credentials.effective_api_region(&config);
+        assert_eq!(api_region, "us-west-2");
     }
 
     #[test]

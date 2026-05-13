@@ -23,33 +23,67 @@ use crate::model::config::CompressionConfig;
 /// 单请求图片总数上限（所有消息合计，含 GIF 抽帧后的帧数）
 const MAX_TOTAL_IMAGES: usize = 20;
 
+/// kiro-cli 2.3.0 wire-aligned system-injection ack (Q_LOG_LEVEL=trace
+/// 2026-05-12 capture, history[1].assistantResponseMessage.content). Must
+/// match byte-for-byte — it's part of the server's prefix-cache key.
+const SYSTEM_ACK: &str = "I will fully incorporate this information when generating my responses, and explicitly acknowledge relevant parts of the summary when answering questions.";
+
+/// Wrap a system prompt for history injection the same way kiro-cli does:
+/// empty CONTEXT ENTRY block + a blank line + `Follow this instruction: <text>`.
+/// kiro-cli 2.3.0 wire literal: `"--- CONTEXT ENTRY BEGIN ---\n--- CONTEXT
+/// ENTRY END ---\n\nFollow this instruction: <text>"`.
+///
+/// 防御性：若 `text` 已含 `--- CONTEXT ENTRY BEGIN ---` 或 `Follow this instruction:`
+/// 前缀（例如用户直接把上一轮 wire 透传，或上游 caller 已经 wrap 过），不重复包装，
+/// 避免 `Follow this instruction: Follow this instruction:` 双层破坏 prefix cache key。
+fn wrap_system_for_history(text: &str) -> String {
+    let trimmed = text.trim_start();
+    if trimmed.starts_with("--- CONTEXT ENTRY BEGIN ---")
+        || trimmed.starts_with("Follow this instruction:")
+    {
+        return text.to_string();
+    }
+    format!(
+        "--- CONTEXT ENTRY BEGIN ---\n--- CONTEXT ENTRY END ---\n\nFollow this instruction: {text}"
+    )
+}
+
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
 ///
 /// Claude Code / MCP 工具定义偶尔会出现 `required: null`、`properties: null` 等，
-/// 导致上游返回 400 "Improperly formed request"。
+/// 导致上游返回 400 "Improperly formed request"（参见
+/// `docs/troubleshooting/400-improperly-formed-request.md` TC-07）。
+///
+/// **Round 6 灰度结论**（2026-05-13）: `$schema` 和 `additionalProperties` 这两
+/// 个字段的"缺失补默认"逻辑被证实**没有任何**避免 400 的实际作用 —— 实测三种
+/// schema 形态（正常 / 空 properties / 缺 type）裁剪后上游均 200。troubleshooting
+/// 文档归因的 400 触发点都跟这两个字段无关。
+///
+/// 因此改为：`$schema` 和 `additionalProperties` **缺失时不补**（与 kiro-cli 2.3.0
+/// wire 字节对齐，每工具节约 ~80B 并消除 prefix-cache key 偏移）；仅在字段存在
+/// 但形态非法时纠正。`type` / `properties` / `required` 三个字段是 TC-07 真正治理
+/// 的目标，**保留**缺失补默认。
 fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     let serde_json::Value::Object(mut obj) = schema else {
+        // 整体非 object → 兜底空 schema。不补 $schema/additionalProperties。
         return serde_json::json!({
             "type": "object",
             "properties": {},
             "required": [],
-            "additionalProperties": true
         });
     };
 
-    // $schema（必须是非空字符串）
-    if obj
-        .get("$schema")
-        .and_then(|v| v.as_str())
-        .is_none_or(|s| s.is_empty())
-    {
-        obj.insert(
-            "$schema".to_string(),
-            serde_json::Value::String("http://json-schema.org/draft-07/schema#".to_string()),
-        );
+    // $schema：缺失不补；存在但非合法非空字符串才纠正。
+    if let Some(v) = obj.get("$schema") {
+        if v.as_str().is_none_or(|s| s.is_empty()) {
+            obj.insert(
+                "$schema".to_string(),
+                serde_json::Value::String("http://json-schema.org/draft-07/schema#".to_string()),
+            );
+        }
     }
 
-    // type（必须是字符串）
+    // type（必须是字符串）—— 这是 MCP 异常的常见目标，保留缺失补默认。
     if obj
         .get("type")
         .and_then(|v| v.as_str())
@@ -61,7 +95,7 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
         );
     }
 
-    // properties（必须是 object）
+    // properties（必须是 object）—— 保留 null/缺失兜底。
     match obj.get("properties") {
         Some(serde_json::Value::Object(_)) => {}
         _ => {
@@ -72,7 +106,7 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
         }
     }
 
-    // required（必须是 string 数组）
+    // required（必须是 string 数组）—— 保留 null/异常元素兜底。
     let required = match obj.remove("required") {
         Some(serde_json::Value::Array(arr)) => serde_json::Value::Array(
             arr.into_iter()
@@ -83,10 +117,9 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     };
     obj.insert("required".to_string(), required);
 
-    // additionalProperties（允许 bool 或 object，其他按 true 处理）
-    match obj.get("additionalProperties") {
-        Some(serde_json::Value::Bool(_)) | Some(serde_json::Value::Object(_)) => {}
-        _ => {
+    // additionalProperties：缺失不补；存在但非 bool/object 才纠正为 true。
+    if let Some(v) = obj.get("additionalProperties") {
+        if !v.is_boolean() && !v.is_object() {
             obj.insert(
                 "additionalProperties".to_string(),
                 serde_json::Value::Bool(true),
@@ -262,6 +295,44 @@ fn is_valid_uuid(s: &str) -> bool {
     s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4
 }
 
+/// 用**首条 user message** SHA-256 指纹派生跨 turn 稳定的 conversation_id。
+///
+/// **Round 7 重要更新（2026-05-13）**: 之前实现哈希 `messages[..len-1]`，但这个
+/// 切片在每轮多轮里都在膨胀（turn N 切 [0..N-1]，turn N+1 切 [0..N+1]）
+/// → SHA-256 必然不同 → conversation_id 每轮变。Round 7 cache 长程实测员
+/// 抓了 8 轮 capture，conversationId 8 个不同值，**证实 fingerprint 每轮变**。
+///
+/// **但 cache 仍然命中**（同轮实测 13× credits/token 折扣）—— 因为 Bedrock prompt
+/// cache 真实机制基于**请求 body 字节前缀哈希**（system + history 序列化），
+/// **不依赖** conversationId。conversationId 在 Bedrock 看来只是上游遥测聚合
+/// 字段，跨 turn 变化不影响 cache 命中。
+///
+/// 既然 cache 真因不在这里，fingerprint 的价值降级为"减少上游遥测 conv_id 噪声"。
+/// 改为只哈希**首条 message** 的 role + content 文本：
+///   - 跨 turn 字节级稳定（首条不变）
+///   - 不含 thinking signature 这类客户端可能漂移的字段
+///   - 不同会话有不同 fingerprint（首条 user 通常不同）
+///
+/// 返回 None: messages 空，让上层走 v4。
+fn messages_history_fingerprint(messages: &[crate::anthropic::types::Message]) -> Option<String> {
+    let first = messages.first()?;
+    let mut hasher = Sha256::new();
+    hasher.update(first.role.as_bytes());
+    hasher.update(b"\x1f");
+    // 优先取字符串形态（最常见、字节最稳定）；array 形态退而求其次走 JSON 序列化。
+    // 注意：这里只哈希**首条** message —— Anthropic SDK 把 assistant 写回 history
+    // 时不会回去改首条 user message，所以这是会话级稳定 anchor。
+    if let Some(s) = first.content.as_str() {
+        hasher.update(s.as_bytes());
+    } else {
+        let s = serde_json::to_string(&first.content).unwrap_or_default();
+        hasher.update(s.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let bytes: [u8; 16] = digest[..16].try_into().ok()?;
+    Some(Uuid::new_v5(&Uuid::NAMESPACE_DNS, &bytes).to_string())
+}
+
 /// Kiro API 工具名称最大长度限制
 const TOOL_NAME_MAX_LEN: usize = 63;
 
@@ -314,17 +385,20 @@ fn collect_history_tool_names(history: &[Message]) -> Vec<String> {
 
 /// 为历史中使用但不在 tools 列表中的工具创建占位符定义
 /// Kiro API 要求：历史消息中引用的工具必须在 currentMessage.tools 中有定义
+///
+/// **Round 7 (2026-05-13)**: 保持与 `normalize_json_schema` 一致 ——
+/// 不主动写入 `$schema` 与 `additionalProperties` 字段（Round 6 已确认
+/// kiro-cli 2.3.0 wire 不发这两个字段；强加会偏移 prefix-cache key、
+/// 每工具浪费 ~80B）。
 fn create_placeholder_tool(name: &str) -> KiroTool {
     KiroTool {
         tool_specification: ToolSpecification {
             name: name.to_string(),
             description: "Tool used in conversation history".to_string(),
             input_schema: InputSchema::from_json(serde_json::json!({
-                "$schema": "http://json-schema.org/draft-07/schema#",
                 "type": "object",
                 "properties": {},
-                "required": [],
-                "additionalProperties": true
+                "required": []
             })),
         },
     }
@@ -387,14 +461,30 @@ pub fn convert_request(
     }
 
     // 3. 生成会话 ID 和代理 ID
-    // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId
+    //
+    // 优先级:
+    //   (a) metadata.user_id 含 session UUID → 直接取
+    //   (b) 否则用 history 前缀（除最后一条 user）SHA-256 指纹做 fallback。
+    //       proxy 是无状态的，但同一会话的"已经发生过的对话"对每次请求都稳定；
+    //       同一上下文 → 同一 conversation_id → 同一 v5 派生的 agentContinuationId。
+    //   (c) 单轮且无 metadata 时（history 为空），退化为 Uuid::v4。
+    //
+    // 重要：旧实现在 (a) 失败时直接 Uuid::v4，导致 Anthropic SDK 默认配置
+    // （不传 metadata.user_id）下每请求一个新 conversation_id，
+    // patch #6 (agentContinuationId v5 派生) 完全空操作 → 多轮 prefix cache 失效。
     let conversation_id = req
         .metadata
         .as_ref()
         .and_then(|m| m.user_id.as_ref())
         .and_then(|user_id| extract_session_id(user_id))
+        .or_else(|| messages_history_fingerprint(messages))
         .unwrap_or_else(|| Uuid::new_v4().to_string());
-    let agent_continuation_id = Uuid::new_v4().to_string();
+    // kiro-cli 2.3.0 multi-turn capture (gar-body-1.json & gar-body-3.json)
+    // shows the same `agentContinuationId` across every turn of one session —
+    // it's a session-stable ID, not per-request. We derive it deterministically
+    // from `conversation_id` so repeat requests under the same session reuse it.
+    let agent_continuation_id =
+        Uuid::new_v5(&Uuid::NAMESPACE_DNS, conversation_id.as_bytes()).to_string();
 
     // 4. 确定触发类型
     let chat_trigger_type = determine_chat_trigger_type(req);
@@ -1100,39 +1190,48 @@ fn build_history(
                 system_content
             };
 
-            // 注入thinking标签到系统消息最前面（如果需要且不存在）
-            let final_content = if let Some(ref prefix) = thinking_prefix {
-                if !has_thinking_tags(&system_content) {
-                    format!("{}\n{}", prefix, system_content)
-                } else {
-                    system_content
-                }
-            } else {
-                system_content
+            // 系统消息作为 user + assistant 配对。
+            //
+            // kiro-cli 2.3.0 wire format (Q_LOG_LEVEL=trace 2026-05-12 capture):
+            // system 注入是一个空的 CONTEXT ENTRY 包装 + 换行 + `Follow this
+            // instruction: <text>`，对应的 assistant ack 是一段固定的长句。
+            // 这段文案是上游 prefix-cache key 的稳定前缀，文案不一致会让每轮
+            // 重算 system 部分，破坏 cache 命中。
+            //
+            // thinking_prefix（`<thinking_mode>...</thinking_mode>` 元控制标签）
+            // 是给模型自己的元配置，不应当被包进 "Follow this instruction:"
+            // 后面（语义错位 — 模型会把它当成用户指令的一部分）。把它放在
+            // wrap 之外的最前面，与 system 指令分离。
+            let wrapped_system = wrap_system_for_history(&system_content);
+            let history_content = match (&thinking_prefix, has_thinking_tags(&system_content)) {
+                (Some(prefix), false) => format!("{prefix}\n{wrapped_system}"),
+                _ => wrapped_system,
             };
-
-            // 系统消息作为 user + assistant 配对
-            let user_msg = HistoryUserMessage::new(final_content, model_id);
+            let user_msg = HistoryUserMessage::new(history_content, model_id);
             history.push(Message::User(user_msg));
 
-            let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
+            let assistant_msg = HistoryAssistantMessage::new(SYSTEM_ACK);
             history.push(Message::Assistant(assistant_msg));
         }
     } else if thinking_prefix.is_some() || should_inject_chunked_policy {
-        // 没有系统消息但需要注入 thinking 配置或分块写入策略
+        // 没有系统消息但需要注入 thinking 配置或分块写入策略。
+        // 注：此分支没有用户原 system，仅注入控制标签；不走 CONTEXT ENTRY 包装
+        // （CONTEXT ENTRY 是给"用户实际要求"用的，元控制标签不应混入）。
         let mut parts = Vec::new();
         if let Some(ref prefix) = thinking_prefix {
             parts.push(prefix.clone());
         }
         if should_inject_chunked_policy {
-            parts.push(SYSTEM_CHUNKED_POLICY.to_string());
+            // 分块写入策略是协议级行为指令；包成 Follow this instruction: 比裸
+            // 注入更接近 kiro-cli 风格的多 system 处理。
+            parts.push(wrap_system_for_history(SYSTEM_CHUNKED_POLICY));
         }
         let content = parts.join("\n");
 
         let user_msg = HistoryUserMessage::new(content, model_id);
         history.push(Message::User(user_msg));
 
-        let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
+        let assistant_msg = HistoryAssistantMessage::new(SYSTEM_ACK);
         history.push(Message::Assistant(assistant_msg));
     }
 
@@ -1421,6 +1520,10 @@ fn convert_assistant_message(
 
     let mut assistant = AssistantMessage::new(final_content);
     if !tool_uses.is_empty() {
+        // kiro-cli 2.3.0 wire: every toolUse turn carries a `messageId` UUID
+        // (gar-body-3.json line 38). Plain-text turns omit it. We mint a fresh
+        // UUID — server-side it appears to be opaque/ID-only.
+        assistant.message_id = Some(Uuid::new_v4().to_string());
         assistant = assistant.with_tool_uses(tool_uses);
     }
 
@@ -1462,6 +1565,7 @@ fn merge_assistant_messages(
 
     let mut assistant = AssistantMessage::new(content);
     if !all_tool_uses.is_empty() {
+        assistant.message_id = Some(Uuid::new_v4().to_string());
         assistant = assistant.with_tool_uses(all_tool_uses);
     }
     Ok(HistoryAssistantMessage {
@@ -1725,6 +1829,89 @@ mod tests {
             tools.iter().any(|t| t.tool_specification.name == "read"),
             "tools 列表应包含 'read' 工具的占位符定义"
         );
+    }
+
+    /// Round 4 regression: agentContinuationId must be deterministic from
+    /// conversationId — multi-turn captures of kiro-cli 2.3.0 show the same
+    /// continuation UUID across every turn of one session. The proxy is
+    /// stateless so we derive it via UUID v5 on conversation_id.
+    #[test]
+    fn test_wrap_system_for_history_matches_kiro_cli_format() {
+        // Verify the wire-aligned wrapper format.
+        let wrapped = wrap_system_for_history("You are terse.");
+        assert_eq!(
+            wrapped,
+            "--- CONTEXT ENTRY BEGIN ---\n--- CONTEXT ENTRY END ---\n\nFollow this instruction: You are terse."
+        );
+    }
+
+    /// Round 5 regression: wrap_system_for_history must be idempotent when the
+    /// input already starts with the wrapper or `Follow this instruction:`.
+    /// Pre-fix double-wrapping broke the prefix-cache key.
+    #[test]
+    fn test_wrap_system_for_history_idempotent() {
+        let already_wrapped = "--- CONTEXT ENTRY BEGIN ---\n--- CONTEXT ENTRY END ---\n\nFollow this instruction: hi";
+        assert_eq!(wrap_system_for_history(already_wrapped), already_wrapped);
+        let with_follow_prefix = "Follow this instruction: hi";
+        assert_eq!(wrap_system_for_history(with_follow_prefix), with_follow_prefix);
+        // Whitespace at the head must not break detection.
+        let leading_ws = "  Follow this instruction: hi";
+        assert_eq!(wrap_system_for_history(leading_ws), leading_ws);
+    }
+
+    /// Round 7 regression: messages_history_fingerprint is keyed on the
+    /// **first message only** (post-Round 7 redesign). Same first message →
+    /// same fingerprint across ALL turns of the same session, even as
+    /// history grows. Different first message → different fingerprint.
+    #[test]
+    fn test_messages_history_fingerprint_stability() {
+        use crate::anthropic::types::Message;
+        let mk = |role: &str, content: &str| Message {
+            role: role.to_string(),
+            content: serde_json::Value::String(content.to_string()),
+        };
+        // Empty messages → None (let caller fall back to v4).
+        let empty: Vec<Message> = vec![];
+        assert!(messages_history_fingerprint(&empty).is_none());
+
+        // Single message → returns Some (Round 7: first-message keying).
+        let single = vec![mk("user", "hi")];
+        let fp_single = messages_history_fingerprint(&single).unwrap();
+
+        // Turn 2 of same session (first message unchanged, new turns appended)
+        // → same fingerprint as turn 1.
+        let turn2 = vec![mk("user", "hi"), mk("assistant", "yo"), mk("user", "again")];
+        let fp_turn2 = messages_history_fingerprint(&turn2).unwrap();
+        assert_eq!(fp_single, fp_turn2, "first-message anchor must persist across turns");
+
+        // Turn 5 of same session — history grew further, fingerprint unchanged.
+        let turn5 = vec![
+            mk("user", "hi"),
+            mk("assistant", "yo"),
+            mk("user", "again"),
+            mk("assistant", "ok"),
+            mk("user", "more"),
+            mk("assistant", "done"),
+            mk("user", "current"),
+        ];
+        let fp_turn5 = messages_history_fingerprint(&turn5).unwrap();
+        assert_eq!(fp_single, fp_turn5, "same first-message → same fingerprint regardless of history length");
+
+        // Different session (different first message) → different fingerprint.
+        let other = vec![mk("user", "different first message")];
+        let fp_other = messages_history_fingerprint(&other).unwrap();
+        assert_ne!(fp_single, fp_other);
+    }
+
+    #[test]
+    fn test_agent_continuation_id_deterministic_from_conversation_id() {
+        let conv = "11111111-2222-3333-4444-555555555555";
+        let id1 = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, conv.as_bytes()).to_string();
+        let id2 = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, conv.as_bytes()).to_string();
+        assert_eq!(id1, id2, "same conversation_id → same agentContinuationId");
+        let id_other =
+            uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"different-conv").to_string();
+        assert_ne!(id1, id_other, "different conversation_id → different id");
     }
 
     #[test]
@@ -2295,10 +2482,13 @@ mod tests {
             !tool.tool_specification.description.trim().is_empty(),
             "转换后的工具描述不应为空"
         );
-        assert_eq!(
-            tool.tool_specification.input_schema.json["$schema"],
-            "http://json-schema.org/draft-07/schema#"
+        // Round 6: `$schema` is no longer auto-injected when missing from user
+        // input (wire alignment with kiro-cli 2.3.0). It stays absent here.
+        assert!(
+            tool.tool_specification.input_schema.json["$schema"].is_null(),
+            "$schema 缺失时不应自动注入"
         );
+        // `type` IS still backfilled — it's a real MCP-anomaly target (TC-07).
         assert_eq!(tool.tool_specification.input_schema.json["type"], "object");
     }
 
@@ -2582,6 +2772,78 @@ mod tests {
                 .get("additionalProperties")
                 .is_some_and(|v| v.is_boolean())
         );
+    }
+
+    /// Round 7 regression: image content blocks convert to KiroImage with the
+    /// correct format + bytes wire shape. Round 4 wire 字节级对比员实测金准是
+    /// `{"format":"png","source":{"bytes":"..."}}`，四种 media_type 都该支持。
+    #[test]
+    fn test_image_wire_shape_matches_kiro_cli_format() {
+        use super::super::types::Message as AnthropicMessage;
+        // Minimal PNG header (4 bytes is plenty for a wire-shape test).
+        let b64 = "iVBORw0KGgo=";
+        for (media_type, expected_format) in &[
+            ("image/png", "png"),
+            ("image/jpeg", "jpeg"),
+            ("image/gif", "gif"),
+            ("image/webp", "webp"),
+        ] {
+            let req = MessagesRequest {
+                model: "claude-sonnet-4".to_string(),
+                max_tokens: 32,
+                messages: vec![AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": media_type, "data": b64}
+                        },
+                        {"type": "text", "text": "describe"},
+                    ]),
+                }],
+                stream: false,
+                system: None,
+                tools: None,
+                tool_choice: None,
+                thinking: None,
+                output_config: None,
+                metadata: None,
+            };
+            let result = convert_request(&req, &CompressionConfig::default()).unwrap();
+            let imgs = &result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .images;
+            assert_eq!(imgs.len(), 1, "media_type {} should yield 1 image", media_type);
+            assert_eq!(imgs[0].format, *expected_format, "format mapping for {}", media_type);
+            assert!(!imgs[0].source.bytes.is_empty(), "source.bytes must be populated");
+        }
+    }
+
+    /// Round 6 regression: `$schema` and `additionalProperties` are now wire-aligned
+    /// with kiro-cli 2.3.0 — when missing from user-provided schema, they stay
+    /// missing (not auto-injected). This shaves ~80B per tool off the prefix-cache
+    /// key. The other three fields (type / properties / required) still backfill.
+    #[test]
+    fn test_normalize_json_schema_does_not_inject_missing_schema_field() {
+        let input = serde_json::json!({
+            "type": "object",
+            "properties": {"x": {"type": "string"}},
+        });
+        let normalized = normalize_json_schema(input);
+        assert!(
+            normalized.get("$schema").is_none(),
+            "missing $schema must NOT be auto-injected (wire alignment with kiro-cli)"
+        );
+        assert!(
+            normalized.get("additionalProperties").is_none(),
+            "missing additionalProperties must NOT be auto-injected"
+        );
+        // But type/properties/required still ensured present (these treat MCP anomalies).
+        assert_eq!(normalized.get("type").and_then(|v| v.as_str()), Some("object"));
+        assert!(normalized.get("properties").is_some());
+        assert!(normalized.get("required").is_some());
     }
 
     #[test]

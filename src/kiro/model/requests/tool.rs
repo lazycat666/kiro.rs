@@ -16,16 +16,20 @@ pub struct Tool {
 
 /// 工具规范
 ///
-/// 定义工具的名称、描述和输入模式
+/// 定义工具的名称、描述和输入模式。
+///
+/// Field declaration order matches kiro-cli 2.3.0 wire (Q_LOG_LEVEL=trace
+/// 2026-05-12):  inputSchema, name, description  (not the more natural
+/// name/description/inputSchema). serde-json preserves declaration order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolSpecification {
+    /// 输入模式（JSON Schema）
+    pub input_schema: InputSchema,
     /// 工具名称
     pub name: String,
     /// 工具描述
     pub description: String,
-    /// 输入模式（JSON Schema）
-    pub input_schema: InputSchema,
 }
 
 /// 输入模式

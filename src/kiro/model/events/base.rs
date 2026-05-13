@@ -16,6 +16,8 @@ pub enum EventType {
     Metering,
     /// 上下文使用率事件
     ContextUsage,
+    /// 初始响应事件（流的第一帧，包含服务端分配的 conversationId）
+    InitialResponse,
     /// 未知事件类型
     Unknown,
 }
@@ -28,6 +30,7 @@ impl EventType {
             "toolUseEvent" => Self::ToolUse,
             "meteringEvent" => Self::Metering,
             "contextUsageEvent" => Self::ContextUsage,
+            "initialResponseEvent" => Self::InitialResponse,
             _ => Self::Unknown,
         }
     }
@@ -39,6 +42,7 @@ impl EventType {
             Self::ToolUse => "toolUseEvent",
             Self::Metering => "meteringEvent",
             Self::ContextUsage => "contextUsageEvent",
+            Self::InitialResponse => "initialResponseEvent",
             Self::Unknown => "unknown",
         }
     }
@@ -71,6 +75,14 @@ pub enum Event {
     Metering(super::MeteringEvent),
     /// 上下文使用率
     ContextUsage(super::ContextUsageEvent),
+    /// 初始响应（首帧，含 conversationId）
+    InitialResponse {
+        /// 服务端分配的 conversationId（可能为空字符串）。
+        /// 预留：未来 stream handler 可用它做 server-authoritative
+        /// conversationId affinity（覆盖客户端生成的 UUID）。
+        #[allow(dead_code)]
+        conversation_id: String,
+    },
     /// 未知事件 (保留原始帧数据)
     Unknown {},
     /// 服务端错误
@@ -123,6 +135,21 @@ impl Event {
             EventType::ContextUsage => {
                 let payload = super::ContextUsageEvent::from_frame(&frame)?;
                 Ok(Self::ContextUsage(payload))
+            }
+            EventType::InitialResponse => {
+                // Payload shape: `{"conversationId":""}` (may be populated by
+                // server). We just lift the id — no dedicated payload struct
+                // needed since the field is single-purpose.
+                let payload_str = frame.payload_as_str();
+                let conversation_id = serde_json::from_str::<serde_json::Value>(&payload_str)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("conversationId")
+                            .and_then(|s| s.as_str())
+                            .map(String::from)
+                    })
+                    .unwrap_or_default();
+                Ok(Self::InitialResponse { conversation_id })
             }
             EventType::Unknown => Ok(Self::Unknown {}),
         }

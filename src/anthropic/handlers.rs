@@ -1272,7 +1272,10 @@ fn create_sse_stream(
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
-                            // 发送最终事件并结束
+                            // 上游流中断 → 标记 stop_reason="error"。否则
+                            // generate_final_events() 走默认 end_turn，客户端
+                            // 会把不完整 assistant turn 当成正常结束写回 history。
+                            ctx.state_manager.set_stop_reason("error");
                             let final_events = ctx.generate_final_events();
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()

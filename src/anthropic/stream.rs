@@ -273,7 +273,12 @@ impl SseStateManager {
     }
 
     /// stop_reason 优先级（索引越小优先级越高）
+    ///
+    /// `error` 是 Anthropic 非标准但被 Anthropic SDK 客户端识别的 stop reason：
+    /// 上游流中断、Smithy exception 等异常路径走这条，让客户端知道这一轮 assistant
+    /// 内容是异常截断的，而不是被当成 end_turn 写回 history 污染后续对话。
     const STOP_REASON_PRIORITY: &'static [&'static str] = &[
+        "error",
         "model_context_window_exceeded",
         "max_tokens",
         "tool_use",
@@ -609,6 +614,18 @@ impl StreamContext {
     /// 处理 Kiro 事件并转换为 Anthropic SSE 事件
     pub fn process_kiro_event(&mut self, event: &Event) -> Vec<SseEvent> {
         match event {
+            Event::InitialResponse { conversation_id } => {
+                // 服务端首帧含 server-authoritative conversationId。当前
+                // 我们已经用客户端派生 ID（converter.rs::convert_request），
+                // 这里只用作可观测性 — 把上游 ID 落到 trace 便于关联日志。
+                if !conversation_id.is_empty() {
+                    tracing::debug!(
+                        server_conversation_id = %conversation_id,
+                        "收到 initialResponseEvent"
+                    );
+                }
+                Vec::new()
+            }
             Event::AssistantResponse(resp) => self.process_assistant_response(&resp.content),
             Event::ToolUse(tool_use) => self.process_tool_use(tool_use),
             Event::ContextUsage(context_usage) => {
@@ -645,7 +662,19 @@ impl StreamContext {
                 error_message,
             } => {
                 tracing::error!("收到错误事件: {} - {}", error_code, error_message);
-                Vec::new()
+                // 上游业务错误 → 转 Anthropic SSE error event + 标记 stop_reason
+                // 让客户端能感知（throttling、content filter 等）。
+                self.state_manager.set_stop_reason("error");
+                vec![SseEvent::new(
+                    "error",
+                    json!({
+                        "type": "error",
+                        "error": {
+                            "type": error_code,
+                            "message": error_message,
+                        }
+                    }),
+                )]
             }
             Event::Exception {
                 exception_type,
@@ -654,9 +683,22 @@ impl StreamContext {
                 // 处理 ContentLengthExceededException
                 if exception_type == "ContentLengthExceededException" {
                     self.state_manager.set_stop_reason("max_tokens");
+                    tracing::warn!("收到异常事件: {} - {}", exception_type, message);
+                    return Vec::new();
                 }
                 tracing::warn!("收到异常事件: {} - {}", exception_type, message);
-                Vec::new()
+                // 其他 exception → 也转 SSE error event 并标记 stop_reason=error
+                self.state_manager.set_stop_reason("error");
+                vec![SseEvent::new(
+                    "error",
+                    json!({
+                        "type": "error",
+                        "error": {
+                            "type": exception_type,
+                            "message": message,
+                        }
+                    }),
+                )]
             }
             _ => Vec::new(),
         }
@@ -777,6 +819,8 @@ impl StreamContext {
                     if let Some(thinking_index) = self.thinking_block_index {
                         // 先发送空的 thinking_delta
                         events.push(self.create_thinking_delta_event(thinking_index, ""));
+                        // 在 content_block_stop 之前发 signature_delta（Anthropic 规范）
+                        events.push(self.create_thinking_signature_event(thinking_index));
                         // 再发送 content_block_stop
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
@@ -902,6 +946,34 @@ impl StreamContext {
         )
     }
 
+    /// 创建 signature_delta 事件（thinking 块关闭前发送）。
+    ///
+    /// Anthropic Messages 规范要求 `thinking` content block 在 `content_block_stop`
+    /// 之前发一个 `signature_delta`，客户端 SDK 会把它原样写回 history。
+    ///
+    /// **Round 6 实测结论**（2026-05-13）：
+    /// - 空字符串 `""`：Anthropic SDK 接受、Kiro 上游接受（HTTP 200）、客户端 schema 校验通过
+    /// - 缺字段：上游 HTTP 502 — 所以字段**必须存在**
+    /// - 任意伪造签名（含 SHA-256(thinking) / stub 占位）：Kiro 上游不识别为合法
+    ///   thinking-cache token，`cache_read_input_tokens` 仍为 0。
+    ///
+    /// 因此空字符串是最优解：满足 schema、零 CPU 开销、与伪造方案功能等价。
+    /// 真正的 thinking-level cache 需要 Kiro 上游回传合法 signature 才能启用，
+    /// 这是上游未实现的特性，不是 proxy 能补的。
+    fn create_thinking_signature_event(&self, index: i32) -> SseEvent {
+        SseEvent::new(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {
+                    "type": "signature_delta",
+                    "signature": ""
+                }
+            }),
+        )
+    }
+
     /// 处理工具使用事件
     fn process_tool_use(
         &mut self,
@@ -933,6 +1005,8 @@ impl StreamContext {
             if let Some(thinking_index) = self.thinking_block_index {
                 // 先发送空的 thinking_delta
                 events.push(self.create_thinking_delta_event(thinking_index, ""));
+                // 在 content_block_stop 之前发 signature_delta（Anthropic 规范）
+                events.push(self.create_thinking_signature_event(thinking_index));
                 // 再发送 content_block_stop
                 if let Some(stop_event) =
                     self.state_manager.handle_content_block_stop(thinking_index)
@@ -1045,9 +1119,10 @@ impl StreamContext {
                         );
                     }
 
-                    // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
+                    // 关闭 thinking 块：先发送空的 thinking_delta + signature_delta，再发送 content_block_stop
                     if let Some(thinking_index) = self.thinking_block_index {
                         events.push(self.create_thinking_delta_event(thinking_index, ""));
+                        events.push(self.create_thinking_signature_event(thinking_index));
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
                         {
@@ -1075,6 +1150,8 @@ impl StreamContext {
                     if let Some(thinking_index) = self.thinking_block_index {
                         // 先发送空的 thinking_delta
                         events.push(self.create_thinking_delta_event(thinking_index, ""));
+                        // 在 content_block_stop 之前发 signature_delta（Anthropic 规范）
+                        events.push(self.create_thinking_signature_event(thinking_index));
                         // 再发送 content_block_stop
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
@@ -1199,6 +1276,101 @@ mod tests {
             cache_creation_5m_input_tokens,
             cache_creation_1h_input_tokens,
         })
+    }
+
+    /// Round 7 regression: "error" must be the highest-priority stop_reason,
+    /// covering end_turn / tool_use / max_tokens / model_context_window_exceeded.
+    /// 上游流中断 (handlers.rs Some(Err(e)) 分支) 与 Event::Error/Exception 都靠
+    /// 这个优先级覆盖默认 end_turn —— Round 5 patch #11-13 的回归保护。
+    #[test]
+    fn test_stop_reason_priority_error_wins_over_end_turn() {
+        let mut mgr = SseStateManager::new();
+        // 先设了 end_turn，再设 error 应该覆盖。
+        mgr.set_stop_reason("end_turn");
+        mgr.set_stop_reason("error");
+        // 模拟 final delta 抽出最终 stop_reason。
+        let final_reason = mgr.stop_reason.clone();
+        assert_eq!(final_reason.as_deref(), Some("error"));
+    }
+
+    #[test]
+    fn test_stop_reason_priority_error_wins_over_tool_use_and_max_tokens() {
+        for first_set in &["tool_use", "max_tokens", "model_context_window_exceeded"] {
+            let mut mgr = SseStateManager::new();
+            mgr.set_stop_reason(*first_set);
+            mgr.set_stop_reason("error");
+            assert_eq!(
+                mgr.stop_reason.as_deref(),
+                Some("error"),
+                "error must override {}",
+                first_set
+            );
+        }
+    }
+
+    /// Round 7 regression: Event::Error gets converted to an Anthropic SSE error
+    /// event AND set stop_reason="error" — Round 5 patch #13.
+    #[test]
+    fn test_event_error_emits_sse_error_event() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-sonnet-4",
+            0,
+            None,
+            false,
+            HashMap::new(),
+        );
+        let events = ctx.process_kiro_event(&Event::Error {
+            error_code: "ThrottlingException".to_string(),
+            error_message: "Rate limited".to_string(),
+        });
+        assert_eq!(events.len(), 1, "Event::Error should emit one SSE error event");
+        assert_eq!(events[0].event, "error");
+        let data = &events[0].data;
+        assert_eq!(data["type"], "error");
+        assert_eq!(data["error"]["type"], "ThrottlingException");
+        assert_eq!(data["error"]["message"], "Rate limited");
+        assert_eq!(ctx.state_manager.stop_reason.as_deref(), Some("error"));
+    }
+
+    /// Round 7 regression: Event::Exception (non ContentLengthExceededException)
+    /// also flows through the new "error" SSE path.
+    #[test]
+    fn test_event_exception_emits_sse_error_event() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-sonnet-4",
+            0,
+            None,
+            false,
+            HashMap::new(),
+        );
+        let events = ctx.process_kiro_event(&Event::Exception {
+            exception_type: "InternalServerException".to_string(),
+            message: "boom".to_string(),
+        });
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "error");
+        assert_eq!(events[0].data["error"]["type"], "InternalServerException");
+        assert_eq!(ctx.state_manager.stop_reason.as_deref(), Some("error"));
+    }
+
+    /// Round 7 regression: ContentLengthExceededException stays on its
+    /// "max_tokens" override (NOT mapped to "error"), preserving Round 5's
+    /// special-case for the more semantically-precise stop_reason.
+    #[test]
+    fn test_event_content_length_exceeded_keeps_max_tokens() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "claude-sonnet-4",
+            0,
+            None,
+            false,
+            HashMap::new(),
+        );
+        let events = ctx.process_kiro_event(&Event::Exception {
+            exception_type: "ContentLengthExceededException".to_string(),
+            message: "too long".to_string(),
+        });
+        assert!(events.is_empty(), "ContentLengthExceededException emits no SSE event");
+        assert_eq!(ctx.state_manager.stop_reason.as_deref(), Some("max_tokens"));
     }
 
     #[test]

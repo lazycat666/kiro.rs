@@ -8,26 +8,32 @@ use super::tool::{Tool, ToolResult, ToolUseEntry};
 
 /// 对话状态
 ///
-/// Kiro API 请求中的核心结构，包含当前消息和历史记录
+/// Kiro API 请求中的核心结构，包含当前消息和历史记录。
+///
+/// Field declaration order matches kiro-cli 2.3.0 wire (Q_LOG_LEVEL=trace
+/// capture 2026-05-12):
+///   conversationId, history, currentMessage, chatTriggerType,
+///   agentContinuationId, agentTaskType
+/// serde-json preserves struct declaration order on serialization.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConversationState {
+    /// 会话 ID
+    pub conversation_id: String,
+    /// 历史消息列表
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<Message>,
+    /// 当前消息
+    pub current_message: CurrentMessage,
+    /// 聊天触发类型（"MANUAL" 或 "AUTO"）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_trigger_type: Option<String>,
     /// 代理延续 ID
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_continuation_id: Option<String>,
     /// 代理任务类型（通常为 "vibe"）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_task_type: Option<String>,
-    /// 聊天触发类型（"MANUAL" 或 "AUTO"）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chat_trigger_type: Option<String>,
-    /// 当前消息
-    pub current_message: CurrentMessage,
-    /// 会话 ID
-    pub conversation_id: String,
-    /// 历史消息列表
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub history: Vec<Message>,
 }
 
 impl ConversationState {
@@ -102,21 +108,25 @@ impl CurrentMessage {
 }
 
 /// 用户输入消息
+///
+/// Field declaration order matches kiro-cli 2.3.0 wire:
+///   content, userInputMessageContext, origin, modelId
+/// (images is non-CLI extension — kept at end with skip_if_empty.)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserInputMessage {
-    /// 用户输入消息上下文
-    pub user_input_message_context: UserInputMessageContext,
     /// 消息内容
     pub content: String,
+    /// 用户输入消息上下文
+    pub user_input_message_context: UserInputMessageContext,
+    /// 消息来源（通常为 "KIRO_CLI"，IDE 路径下为 "AI_EDITOR"）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
     /// 模型 ID
     pub model_id: String,
     /// 图片列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<KiroImage>,
-    /// 消息来源（通常为 "AI_EDITOR"）
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub origin: Option<String>,
 }
 
 impl UserInputMessage {
@@ -152,16 +162,60 @@ impl UserInputMessage {
 
 /// 用户输入消息上下文
 ///
-/// 包含工具定义和工具执行结果
+/// 包含工具定义、工具执行结果以及环境状态。
+///
+/// Field order matches kiro-cli 2.3.0 multi-turn wire capture
+/// (Q_LOG_LEVEL=trace 2026-05-12, gar-body-3.json):
+///     { envState, toolResults, tools }
+/// Note `toolResults` BEFORE `tools` — observed in real toolUse turn payloads.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserInputMessageContext {
+    /// 环境状态（操作系统 + 当前工作目录）。kiro-cli 自动注入。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env_state: Option<EnvState>,
     /// 工具执行结果列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_results: Vec<ToolResult>,
     /// 可用工具列表
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Tool>,
+}
+
+/// 环境状态（kiro-cli envState）
+///
+/// Verified wire fields (kiro-cli 2.3.0 trace 2026-05-12):
+///   operatingSystem: "macos" | "linux" | "windows"
+///   currentWorkingDirectory: 绝对路径
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvState {
+    pub operating_system: String,
+    pub current_working_directory: String,
+}
+
+impl EnvState {
+    /// 用当前进程的 OS + cwd 填充。CLI/IDE 都用同一套。
+    ///
+    /// Currently the CLI endpoint injects envState directly as JSON via
+    /// `transform_body` (untyped path) so this typed constructor is reserved
+    /// for future converter-side use.
+    #[allow(dead_code)]
+    pub fn from_process() -> Self {
+        let operating_system = if cfg!(target_os = "macos") {
+            "macos"
+        } else if cfg!(target_os = "windows") {
+            "windows"
+        } else {
+            "linux"
+        }
+        .to_string();
+        let current_working_directory = std::env::current_dir()
+            .ok()
+            .and_then(|p| p.to_str().map(String::from))
+            .unwrap_or_default();
+        Self { operating_system, current_working_directory }
+    }
 }
 
 impl UserInputMessageContext {
@@ -265,26 +319,29 @@ impl HistoryUserMessage {
 }
 
 /// 用户消息（历史记录中使用）
+///
+/// Field declaration order matches kiro-cli wire:
+///   content, userInputMessageContext, origin, modelId
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserMessage {
     /// 消息内容
     pub content: String,
-    /// 模型 ID
-    pub model_id: String,
-    /// 消息来源
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub origin: Option<String>,
-    /// 图片列表
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub images: Vec<KiroImage>,
     /// 用户输入消息上下文
     #[serde(default, skip_serializing_if = "is_default_context")]
     pub user_input_message_context: UserInputMessageContext,
+    /// 消息来源
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// 模型 ID
+    pub model_id: String,
+    /// 图片列表
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<KiroImage>,
 }
 
 fn is_default_context(ctx: &UserInputMessageContext) -> bool {
-    ctx.tools.is_empty() && ctx.tool_results.is_empty()
+    ctx.tools.is_empty() && ctx.tool_results.is_empty() && ctx.env_state.is_none()
 }
 
 impl UserMessage {
@@ -330,9 +387,17 @@ impl HistoryAssistantMessage {
 }
 
 /// 助手消息（历史记录中使用）
+///
+/// Field order matches kiro-cli 2.3.0 wire (gar-body-3.json):
+///   { messageId, content, toolUses }
+/// `messageId` is only set on turns that carry `toolUses` (kiro-cli skips it
+/// on plain text turns like the system-injection ack).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssistantMessage {
+    /// 消息 ID（仅在含 toolUses 的回合发送；plain-text 回合省略）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
     /// 响应内容
     pub content: String,
     /// 工具使用列表
@@ -344,6 +409,7 @@ impl AssistantMessage {
     /// 创建新的助手消息
     pub fn new(content: impl Into<String>) -> Self {
         Self {
+            message_id: None,
             content: content.into(),
             tool_uses: None,
         }
@@ -352,6 +418,13 @@ impl AssistantMessage {
     /// 设置工具使用
     pub fn with_tool_uses(mut self, tool_uses: Vec<ToolUseEntry>) -> Self {
         self.tool_uses = Some(tool_uses);
+        self
+    }
+
+    /// 设置消息 ID（kiro-cli 在 toolUses 回合上设置 UUID）
+    #[allow(dead_code)]
+    pub fn with_message_id(mut self, id: impl Into<String>) -> Self {
+        self.message_id = Some(id.into());
         self
     }
 }

@@ -319,10 +319,12 @@ impl KiroProvider {
                 "发送 MCP 请求"
             );
             let client = self.get_client_for_credential(&ctx);
+            // Content-Type is endpoint-specific (CLI: application/x-amz-json-1.0,
+            // IDE: application/json). Let decorate_mcp set it; reqwest's .header()
+            // APPENDS on duplicate keys (we don't want two Content-Type values).
             let base_request = client
                 .post(&url)
                 .body(body)
-                .header("content-type", "application/json")
                 .header("Connection", "close");
             let request = endpoint.decorate_mcp(base_request, &request_ctx);
             #[cfg(feature = "sensitive-logs")]
@@ -589,10 +591,22 @@ impl KiroProvider {
 
             // 获取凭据对应的 client（支持凭据级代理）
             let client = self.get_client_for_credential(&ctx);
+            // Content-Type is endpoint-specific (CLI: application/x-amz-json-1.0,
+            // IDE: application/json). Let decorate_api set it; reqwest's .header()
+            // APPENDS on duplicate keys.
+            //
+            // Wire-debug helper: in **debug builds only** (`cfg(debug_assertions)`),
+            // set `KIRO_RS_CAPTURE=/some/dir` to dump the final post-transform
+            // body to a timestamped JSON file. Useful for diff'ing against the
+            // official kiro-cli `Q_LOG_LEVEL=trace` capture (see
+            // docs/golden-gar-body.json) when re-aligning the protocol.
+            // The env::var lookup is cached so the hot path stays one OnceLock
+            // load.
+            #[cfg(debug_assertions)]
+            Self::wire_capture(&final_body);
             let base_request = client
                 .post(&url)
                 .body(final_body)
-                .header("content-type", "application/json")
                 .header("Connection", "close");
             let request = endpoint.decorate_api(base_request, &request_ctx);
             #[cfg(feature = "sensitive-logs")]
@@ -1091,6 +1105,30 @@ impl KiroProvider {
 
     /// 截断请求体用于日志输出，保留头尾各 `keep` 个字符
     ///
+    /// Debug-only wire capture helper. The destination directory is read from
+    /// `KIRO_RS_CAPTURE` exactly once per process and cached, so the hot path
+    /// pays at most one OnceLock load + an `Option::is_some` check when the
+    /// env var is unset.
+    #[cfg(debug_assertions)]
+    fn wire_capture(body: &str) {
+        use std::sync::OnceLock;
+        static DIR: OnceLock<Option<String>> = OnceLock::new();
+        let Some(dir) = DIR.get_or_init(|| std::env::var("KIRO_RS_CAPTURE").ok()) else {
+            return;
+        };
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            tracing::warn!(target: "kiro_rs_capture", "create_dir_all({dir}): {e}");
+            return;
+        }
+        let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f").to_string();
+        let path = format!("{dir}/gar-{ts}.json");
+        if let Err(e) = std::fs::write(&path, body) {
+            tracing::warn!(target: "kiro_rs_capture", "write({path}): {e}");
+            return;
+        }
+        tracing::info!(target: "kiro_rs_capture", "wrote {path} ({} bytes)", body.len());
+    }
+
     /// 避免在 sensitive-logs 模式下输出包含大量 base64 图片数据的完整请求体。
     #[cfg(feature = "sensitive-logs")]
     fn truncate_body_for_log(s: &str, keep: usize) -> std::borrow::Cow<'_, str> {
@@ -1172,23 +1210,28 @@ mod tests {
         let request = endpoint.decorate_api(
             reqwest::Client::new()
                 .post("https://example.com")
-                .header("content-type", "application/json")
                 .header("Connection", "close"),
             &ctx,
         );
         let built = request.build().unwrap();
 
+        // Byte-aligned with kiro-cli 2.3.0 capture 2026-05-12.
         assert_eq!(
             built.headers().get("x-amz-target").unwrap(),
-            "AmazonQDeveloperStreamingService.SendMessage"
+            "AmazonCodeWhispererStreamingService.GenerateAssistantResponse"
+        );
+        assert_eq!(
+            built.headers().get(CONTENT_TYPE).unwrap(),
+            "application/x-amz-json-1.0"
         );
         assert_eq!(
             built.headers().get("x-amzn-codewhisperer-optout").unwrap(),
             "false"
         );
-        assert_eq!(
-            built.headers().get("x-amzn-kiro-agent-mode").unwrap(),
-            "cli"
+        // kiro-cli does NOT send `x-amzn-kiro-agent-mode` on this endpoint.
+        assert!(
+            built.headers().get("x-amzn-kiro-agent-mode").is_none(),
+            "x-amzn-kiro-agent-mode is IDE-only; kiro-cli does not send it"
         );
         assert_eq!(built.headers().get(CONNECTION).unwrap(), "close");
     }
@@ -1215,6 +1258,269 @@ mod tests {
         assert_eq!(
             parsed["conversationState"]["history"][0]["userInputMessage"]["origin"],
             "KIRO_CLI"
+        );
+    }
+
+    /// kiro-cli 2.3.0 wire byte-alignment: confirm transform_api_body emits the
+    /// CONTEXT-ENTRY-wrapped currentMessage.content + envState + auto modelId
+    /// in the exact field order observed in docs/golden-gar-body.json.
+    #[test]
+    fn test_cli_endpoint_transform_api_body_matches_golden_shape() {
+        let endpoint = CliEndpoint::new();
+        let machine_id = "a".repeat(64);
+        let config = Config::default();
+        let credentials = KiroCredentials::default();
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "test_token",
+            machine_id: &machine_id,
+            config: &config,
+        };
+        // Minimal body shape produced by converter (struct declaration order
+        // matches kiro-cli wire; ctx is empty so it serializes as `{}`).
+        let request_body = serde_json::json!({
+            "conversationState": {
+                "conversationId": "conv-1",
+                "history": [
+                    {"userInputMessage": {
+                        "content": "h0",
+                        "origin": "AI_EDITOR",
+                        "modelId": "claude-sonnet-4-20250514"
+                    }},
+                    {"assistantResponseMessage": {"content": "ack"}}
+                ],
+                "currentMessage": {"userInputMessage": {
+                    "content": "hello",
+                    "userInputMessageContext": {},
+                    "origin": "AI_EDITOR",
+                    "modelId": "claude-sonnet-4-20250514"
+                }},
+                "chatTriggerType": "MANUAL",
+                "agentContinuationId": "cont-1",
+                "agentTaskType": "vibe"
+            },
+            "profileArn": "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
+        });
+        let result = endpoint
+            .transform_api_body(&serde_json::to_string(&request_body).unwrap(), &ctx)
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let cs = &parsed["conversationState"];
+        let cur_uim = &cs["currentMessage"]["userInputMessage"];
+
+        // modelId is forced to "auto" on the CLI endpoint.
+        assert_eq!(cur_uim["modelId"], "auto");
+        assert_eq!(cs["history"][0]["userInputMessage"]["modelId"], "auto");
+
+        // origin → KIRO_CLI everywhere.
+        assert_eq!(cur_uim["origin"], "KIRO_CLI");
+
+        // currentMessage.content wrapped with CONTEXT ENTRY / USER MESSAGE
+        // markers + a Current time line.
+        let content = cur_uim["content"].as_str().unwrap();
+        assert!(content.contains("--- CONTEXT ENTRY BEGIN ---"));
+        assert!(content.contains("Current time:"));
+        assert!(content.contains("--- CONTEXT ENTRY END ---"));
+        assert!(content.contains("--- USER MESSAGE BEGIN ---\nhello--- USER MESSAGE END ---"));
+
+        // envState injected on currentMessage and on every history user turn.
+        let cur_ctx = &cur_uim["userInputMessageContext"];
+        assert_eq!(cur_ctx["envState"]["operatingSystem"].as_str().unwrap().len() > 0, true);
+        assert!(cur_ctx["envState"]["currentWorkingDirectory"].as_str().is_some());
+
+        let h0_ctx = &cs["history"][0]["userInputMessage"]["userInputMessageContext"];
+        assert!(h0_ctx["envState"].is_object());
+
+        // Idempotency: running transform_api_body twice doesn't double-wrap.
+        let second = endpoint.transform_api_body(&result, &ctx).unwrap();
+        let second_parsed: serde_json::Value = serde_json::from_str(&second).unwrap();
+        let second_content = second_parsed["conversationState"]["currentMessage"]["userInputMessage"]["content"].as_str().unwrap();
+        assert_eq!(
+            second_content.matches("--- USER MESSAGE BEGIN ---").count(),
+            1,
+            "transform must be idempotent — markers should not stack on retry"
+        );
+    }
+
+    /// Verifies that struct declaration order in conversation.rs matches the
+    /// kiro-cli wire (after preserve_order feature on serde_json reads body
+    /// without alphabetizing).
+    #[test]
+    fn test_cli_endpoint_preserves_field_order_through_transform() {
+        let endpoint = CliEndpoint::new();
+        let machine_id = "a".repeat(64);
+        let config = Config::default();
+        let credentials = KiroCredentials::default();
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "test_token",
+            machine_id: &machine_id,
+            config: &config,
+        };
+        // Build via the typed converter structs so field order is owned by
+        // Rust struct declaration (the path real requests take).
+        use crate::kiro::model::requests::conversation::{
+            ConversationState, CurrentMessage, Message, UserInputMessage,
+        };
+        let cur = CurrentMessage::new(UserInputMessage::new("hi", "claude-sonnet-4").with_origin("AI_EDITOR"));
+        let state = ConversationState::new("c1")
+            .with_history(vec![Message::user("h", "claude-sonnet-4"), Message::assistant("ack")])
+            .with_current_message(cur)
+            .with_chat_trigger_type("MANUAL")
+            .with_agent_continuation_id("ac1")
+            .with_agent_task_type("vibe");
+        let body = serde_json::json!({"conversationState": state, "profileArn": "arn:x"});
+        let result = endpoint.transform_api_body(&serde_json::to_string(&body).unwrap(), &ctx).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let cs = &parsed["conversationState"];
+        let keys: Vec<&str> = cs.as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        // Golden order (kiro-cli 2.3.0): conversationId, history, currentMessage,
+        // chatTriggerType, agentContinuationId, agentTaskType.
+        assert_eq!(
+            keys,
+            vec![
+                "conversationId",
+                "history",
+                "currentMessage",
+                "chatTriggerType",
+                "agentContinuationId",
+                "agentTaskType",
+            ],
+            "conversationState field order must match kiro-cli golden capture"
+        );
+        let cur_keys: Vec<&str> = cs["currentMessage"]["userInputMessage"]
+            .as_object().unwrap().keys().map(|s| s.as_str()).collect();
+        assert_eq!(
+            cur_keys,
+            vec!["content", "userInputMessageContext", "origin", "modelId"],
+            "currentMessage.userInputMessage field order must match golden"
+        );
+    }
+
+    /// Round 4 regression: user-controlled tool inputSchema must NOT be touched
+    /// by rewrite_origin_and_model. Pre-fix the recursion would clobber any
+    /// schema property named "origin" or "modelId" with CLI canonical values.
+    #[test]
+    fn test_cli_endpoint_does_not_rewrite_user_tool_input_schema() {
+        let endpoint = CliEndpoint::new();
+        let machine_id = "a".repeat(64);
+        let config = Config::default();
+        let credentials = KiroCredentials::default();
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "test_token",
+            machine_id: &machine_id,
+            config: &config,
+        };
+        let body = serde_json::json!({
+            "conversationState": {
+                "conversationId": "c1",
+                "currentMessage": {"userInputMessage": {
+                    "content": "hi",
+                    "userInputMessageContext": {
+                        "tools": [{
+                            "toolSpecification": {
+                                "inputSchema": {
+                                    "json": {
+                                        "type": "object",
+                                        "properties": {
+                                            "origin": {"type": "string", "description": "should survive"},
+                                            "modelId": {"type": "string", "description": "should survive"}
+                                        }
+                                    }
+                                },
+                                "name": "tool",
+                                "description": "test"
+                            }
+                        }]
+                    },
+                    "origin": "AI_EDITOR",
+                    "modelId": "claude-sonnet-4-20250514"
+                }},
+                "chatTriggerType": "MANUAL",
+                "agentTaskType": "vibe"
+            },
+            "profileArn": "arn:x"
+        });
+        let result = endpoint
+            .transform_api_body(&serde_json::to_string(&body).unwrap(), &ctx)
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let props = &parsed["conversationState"]["currentMessage"]["userInputMessage"]
+            ["userInputMessageContext"]["tools"][0]["toolSpecification"]["inputSchema"]["json"]
+            ["properties"];
+        // User-defined schema properties must be preserved verbatim.
+        assert_eq!(
+            props["origin"],
+            serde_json::json!({"type": "string", "description": "should survive"})
+        );
+        assert_eq!(
+            props["modelId"],
+            serde_json::json!({"type": "string", "description": "should survive"})
+        );
+        // But the protocol fields ARE rewritten:
+        let cur_uim = &parsed["conversationState"]["currentMessage"]["userInputMessage"];
+        assert_eq!(cur_uim["origin"], "KIRO_CLI");
+        assert_eq!(cur_uim["modelId"], "auto");
+    }
+
+    /// Round 4 regression: CLI endpoint must inject the credential's profileArn
+    /// per-request (previously the field came from a static state snapshot of
+    /// only the FIRST credential — multi-credential rotation broke).
+    #[test]
+    fn test_cli_endpoint_injects_credentials_profile_arn() {
+        let endpoint = CliEndpoint::new();
+        let machine_id = "a".repeat(64);
+        let config = Config::default();
+        let mut credentials = KiroCredentials::default();
+        credentials.profile_arn = Some("arn:per-request-correct".to_string());
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "test_token",
+            machine_id: &machine_id,
+            config: &config,
+        };
+        let body = serde_json::json!({
+            "conversationState": {
+                "conversationId": "c1",
+                "currentMessage": {"userInputMessage": {"content": "hi"}},
+            },
+            "profileArn": "arn:stale-startup-snapshot"
+        });
+        let result = endpoint
+            .transform_api_body(&serde_json::to_string(&body).unwrap(), &ctx)
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["profileArn"], "arn:per-request-correct");
+    }
+
+    /// Round 4 regression: IDC / Builder-ID credentials must NOT send profileArn.
+    #[test]
+    fn test_cli_endpoint_strips_profile_arn_for_sso_oidc() {
+        let endpoint = CliEndpoint::new();
+        let machine_id = "a".repeat(64);
+        let config = Config::default();
+        let mut credentials = KiroCredentials::default();
+        credentials.auth_method = Some("idc".to_string());
+        credentials.profile_arn = Some("arn:should-be-stripped".to_string());
+        let ctx = RequestContext {
+            credentials: &credentials,
+            token: "test_token",
+            machine_id: &machine_id,
+            config: &config,
+        };
+        let body = serde_json::json!({
+            "conversationState": {"conversationId": "c1", "currentMessage": {"userInputMessage": {"content": "hi"}}},
+            "profileArn": "arn:should-also-be-stripped"
+        });
+        let result = endpoint
+            .transform_api_body(&serde_json::to_string(&body).unwrap(), &ctx)
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert!(
+            parsed.get("profileArn").is_none(),
+            "IDC/Builder-ID auth method must strip profileArn (got: {:?})",
+            parsed.get("profileArn")
         );
     }
 
@@ -1277,7 +1583,6 @@ mod tests {
         let request = endpoint.decorate_api(
             reqwest::Client::new()
                 .post("https://example.com")
-                .header("content-type", "application/json")
                 .header("Connection", "close"),
             &ctx,
         );

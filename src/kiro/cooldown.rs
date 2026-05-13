@@ -9,6 +9,21 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 /// 冷却原因
+///
+/// **当前触发覆盖** (Round 7 静态审查 2026-05-13):
+///   生产代码中实际调用 `set_cooldown` 触发的变体:
+///     - `RateLimitExceeded`  ← 上游 429 + 普通 throttle
+///     - `TokenRefreshFailed` ← refresh wire 失败
+///     - `ServerError`        ← 上游 5xx
+///     - `ModelUnavailable`   ← `MODEL_TEMPORARILY_UNAVAILABLE` 全局熔断
+///
+///   尚未被 set_cooldown 实际触发的变体（保留作为 future 分类点）:
+///     - `AuthenticationFailed` — 上游 401/403 非 bearer 失效场景（目前走通用 markFailure）
+///     - `AccountSuspended`     — 上游账户级 suspend 信号（暂无明确 wire 字段）
+///     - `QuotaExhausted`       — 月度配额耗尽（目前走 RateLimitExceeded）
+///
+///   这 3 个变体的 `default_duration()` / `is_retryable()` / `Display` 配置仍完整，
+///   handlers/provider 层日后做细粒度错误分类时可直接使用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CooldownReason {
     /// 429 速率限制
