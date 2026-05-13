@@ -183,11 +183,13 @@ impl CacheTracker {
 
         'outer: for breakpoint in candidate_breakpoints {
             let candidate = &profile.blocks[breakpoint.block_index];
-            if let Some(entry) = credential_entries.get_mut(&candidate.prefix_fingerprint) {
+            if let Some(entry) = credential_entries.get(&candidate.prefix_fingerprint) {
                 if entry.expires_at <= now {
                     continue;
                 }
-                entry.expires_at = now + entry.ttl;
+                // 不在命中时刷新 expires_at。Anthropic 真实 prompt cache TTL 从首次写入计算，
+                // 命中不延期；本地 expires_at 续命会让活动会话的 cache 在本地表里几乎不过期，
+                // 导致 cache_read 数字虚高、与上游真实命中率脱节。
                 matched_tokens = breakpoint.cumulative_tokens.min(profile.total_input_tokens);
                 break 'outer;
             }

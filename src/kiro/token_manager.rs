@@ -1159,11 +1159,20 @@ impl MultiTokenManager {
     /// 如果 Token 过期或即将过期，会自动刷新
     /// Token 刷新失败时会尝试下一个可用凭据（不计入失败次数）
     pub async fn acquire_context(&self) -> anyhow::Result<CallContext> {
+        self.acquire_context_excluding(&[]).await
+    }
+
+    /// 与 `acquire_context` 相同，但额外把 `exclude_ids` 在第一轮就视作"已尝试"，
+    /// 避免 retry 链路重新选回上一次失败的同一个凭据。
+    pub async fn acquire_context_excluding(
+        &self,
+        exclude_ids: &[u64],
+    ) -> anyhow::Result<CallContext> {
         // 检查是否需要自动恢复
         self.check_and_recover();
 
         let total = self.total_count();
-        let mut tried_ids: Vec<u64> = Vec::new();
+        let mut tried_ids: Vec<u64> = exclude_ids.to_vec();
         // 当所有凭据都因“临时不可用”（冷却/速率限制）被跳过时，等待最短可用时间再重试。
         let mut min_wait: Option<std::time::Duration> = None;
         // 记录最短等待时间来自哪个凭据/原因，便于排障定位（冷却 vs 速率限制）。
@@ -1406,14 +1415,26 @@ impl MultiTokenManager {
     ///
     /// 如果用户已绑定凭据且该凭据可用，优先使用绑定的凭据
     /// 否则使用默认的 acquire_context() 逻辑并建立新绑定
+    #[allow(dead_code)]
     pub async fn acquire_context_for_user(
         &self,
         user_id: Option<&str>,
     ) -> anyhow::Result<CallContext> {
+        self.acquire_context_for_user_excluding(user_id, &[]).await
+    }
+
+    /// 与 `acquire_context_for_user` 相同，但 `exclude_ids` 内的凭据会被强制跳过：
+    /// 即使 affinity 命中了被排除的凭据，也会落入 LB 重新选号。
+    /// 用于 retry 链路避免反复选回同一个失败凭据（实测 0% 切换率的关键修复）。
+    pub async fn acquire_context_for_user_excluding(
+        &self,
+        user_id: Option<&str>,
+        exclude_ids: &[u64],
+    ) -> anyhow::Result<CallContext> {
         // 无 user_id 时走默认逻辑
         let user_id = match user_id {
             Some(id) if !id.is_empty() => id,
-            _ => return self.acquire_context().await,
+            _ => return self.acquire_context_excluding(exclude_ids).await,
         };
 
         // 默认保持用户绑定（用于连续对话）。当绑定凭据“临时不可用”（速率限制/短冷却）时，
@@ -1421,7 +1442,10 @@ impl MultiTokenManager {
         let mut keep_affinity_binding = false;
 
         if let Some(bound_id) = self.affinity.get(user_id) {
-            let is_enabled = {
+            // P0#1 修复：retry 时若 affinity 绑定的凭据在 exclude_ids 中（上次失败），
+            // 跳过 affinity 短路逻辑，直接走 LB 重新选号。
+            let bound_excluded = exclude_ids.contains(&bound_id);
+            let is_enabled = !bound_excluded && {
                 let entries = self.entries.lock();
                 entries.iter().any(|e| e.id == bound_id && !e.disabled)
             };
@@ -1498,7 +1522,7 @@ impl MultiTokenManager {
             }
         }
 
-        let ctx = self.acquire_context().await?;
+        let ctx = self.acquire_context_excluding(exclude_ids).await?;
         if !keep_affinity_binding {
             self.affinity.set(user_id, ctx.id);
         }
@@ -2278,6 +2302,16 @@ impl MultiTokenManager {
         }
     }
 
+    /// 返回当前所有未禁用凭据的 id（用于周期 balance 刷新等批量操作）
+    pub fn all_enabled_credential_ids(&self) -> Vec<u64> {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .filter(|e| !e.disabled)
+            .map(|e| e.id)
+            .collect()
+    }
+
     /// 获取全局恢复时间（用于 Admin API）
     #[allow(dead_code)]
     pub fn get_recovery_time(&self) -> Option<DateTime<Utc>> {
@@ -2765,6 +2799,43 @@ impl MultiTokenManager {
                 last_used_at: None,
                 refresh_token_hash: entry_secret_hash,
             });
+        }
+
+        // P0#2 修复：立刻把新凭据写进 balance_cache 并把 recent_usage 设为已有凭据的中位数。
+        // 防止"雷暴效应"：新凭据若以 recent_usage=0 加入 LB，算法会立刻把它判为"最少使用"，
+        // 短时间内瞬间被打满 → 上游 429 雪崩（实测：#6 加入后 1 秒内被打 47 次 429）。
+        // 中位数 baseline 让新凭据"看起来跟现有凭据一样老"，自然进入轮询。
+        {
+            let mut cache = self.balance_cache.lock();
+            let now = std::time::Instant::now();
+            let mut existing_usage: Vec<u32> = cache
+                .iter()
+                .filter(|(id, _)| **id != new_id)
+                .map(|(_, e)| e.recent_usage)
+                .collect();
+            existing_usage.sort_unstable();
+            let median_usage = if existing_usage.is_empty() {
+                0
+            } else {
+                existing_usage[existing_usage.len() / 2]
+            };
+            cache.insert(
+                new_id,
+                CachedBalance {
+                    // remaining=0 时 select 的 effective_balance 也是 0，让新凭据靠 recent_usage
+                    // 维度自然参与 tie-break；后台异步 refresh 完成后会更新到真实值。
+                    remaining: 0.0,
+                    cached_at: now,
+                    initialized: true,
+                    recent_usage: median_usage,
+                    usage_reset_at: now,
+                },
+            );
+            tracing::info!(
+                "凭据 #{} 已加入 balance_cache: recent_usage={}（中位数 baseline，避免雷暴）",
+                new_id,
+                median_usage
+            );
         }
 
         // 6. 持久化

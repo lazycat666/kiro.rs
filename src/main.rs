@@ -174,6 +174,9 @@ async fn main() {
     );
     let kiro_provider = Arc::new(kiro_provider);
 
+    // P0#3：启动周期性 balance 刷新（10 分钟），避免 LB 长期基于陈旧 cache 决策
+    kiro_provider.start_periodic_balance_refresh(600);
+
     // 初始化 count_tokens 配置
     {
         let cfg = config.read();

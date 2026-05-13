@@ -186,6 +186,61 @@ impl KiroProvider {
         &self.token_manager
     }
 
+    /// 启动周期性 balance 刷新任务（P0#3 修复）。
+    ///
+    /// 实测：未修前 24h 0 条 balance refresh log，cache 完全是启动时冻结快照。
+    /// 周期刷新让 LB 在长期运行中获得准确的 balance 信号，避免"陈旧最富"凭据被偏好。
+    ///
+    /// # 参数
+    /// * `interval_secs` - 刷新周期（推荐 600s = 10min）
+    pub fn start_periodic_balance_refresh(self: &Arc<Self>, interval_secs: u64) {
+        let interval_secs = interval_secs.max(60);
+        let provider = Arc::clone(self);
+        tokio::spawn(async move {
+            tracing::info!(
+                interval_secs = interval_secs,
+                "周期性 balance 刷新任务已启动"
+            );
+            // 启动后等一个周期再开始（启动时 initialize_balances 已经刷过一次）
+            let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await; // 立即返回（第一个 tick）
+            loop {
+                ticker.tick().await;
+                let tm = &provider.token_manager;
+                let ids = tm.all_enabled_credential_ids();
+                if ids.is_empty() {
+                    continue;
+                }
+                tracing::debug!(count = ids.len(), "开始周期性 balance 刷新");
+                // 串行 + 间隔，避免对上游突发压力
+                for id in ids {
+                    if !tm.should_refresh_balance(id) {
+                        continue;
+                    }
+                    match tm.get_usage_limits_for(id).await {
+                        Ok(resp) => {
+                            let remaining = resp.usage_limit() - resp.current_usage();
+                            tm.update_balance_cache(id, remaining);
+                            if remaining < 1.0 {
+                                tm.mark_insufficient_balance(id);
+                                tracing::warn!(
+                                    "凭据 #{} 余额不足 ({:.2})，周期刷新触发主动禁用",
+                                    id,
+                                    remaining
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("凭据 #{} 周期 balance 刷新失败: {}", id, e);
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                }
+            }
+        });
+    }
+
     /// 后台异步刷新余额缓存（如果需要）
     fn spawn_balance_refresh(&self, id: u64) {
         // 检查缓存是否需要刷新
@@ -552,14 +607,28 @@ impl KiroProvider {
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut forced_token_refresh: HashSet<u64> = HashSet::new();
+        // P0#1 修复：retry 链路必须排除上次失败的凭据，否则 acquire_context_for_user
+        // 会因 affinity 命中而反复返回同一个绑定凭据。实测未修前 100 burst 切换率 0%。
+        let mut failed_ids: Vec<u64> = Vec::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
 
         for attempt in 0..max_retries {
             // 获取调用上下文（绑定 index、credentials、token），支持用户亲和性
-            let ctx = match self.token_manager.acquire_context_for_user(user_id).await {
+            let ctx = match self
+                .token_manager
+                .acquire_context_for_user_excluding(user_id, &failed_ids)
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
+                    // 已 exclude 的凭据数 ≥ 当前可用集合，下一轮清空让 LB 重新挑选
+                    if failed_ids.len() >= self.token_manager.available_count().max(1) {
+                        failed_ids.clear();
+                    }
+                    if attempt + 1 < max_retries {
+                        sleep(Self::retry_delay(attempt)).await;
+                    }
                     continue;
                 }
             };
@@ -634,6 +703,8 @@ impl KiroProvider {
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
                     last_error = Some(e.into());
+                    // P0#1：本轮 retry 期间临时跳过当前凭据，避免连续撞同一个失败凭据
+                    failed_ids.push(ctx.id);
                     if attempt + 1 < max_retries {
                         sleep(Self::retry_delay(attempt)).await;
                     }
@@ -690,6 +761,8 @@ impl KiroProvider {
                     status,
                     body
                 ));
+                // P0#1：402 凭据已禁用，但仍 push 防止竞争窗口里被再次选回
+                failed_ids.push(ctx.id);
                 continue;
             }
 
@@ -794,6 +867,8 @@ impl KiroProvider {
                     status,
                     body
                 ));
+                // P0#1：401/403 是凭据级真错误，必须切换避免再撞同一个
+                failed_ids.push(ctx.id);
                 continue;
             }
 
@@ -811,12 +886,16 @@ impl KiroProvider {
                 }
 
                 // 折中策略（Round 8 决议）：429 不冻凭据，切下个凭据 retry。
+                // P0#1 强化：本轮 retry 强制 exclude 此凭据，由 LB 重新选号。
+                // 实测背景：未修前 100 burst 测试切换率 0%，21 次连续撞同一凭据；
+                // 24h 切换率仅 1.2%。affinity 命中是元凶——bound_id 没被 exclude
+                // 就一直短路回同一个凭据。
                 // 详见 MCP 同路径注释（line ~459）。
                 let retry_secs = retry_after.map(|d| d.as_secs()).unwrap_or(0);
                 tracing::warn!(
                     credential_id = %ctx.id,
                     retry_after_secs = retry_secs,
-                    "{} API 请求触发 429，不冻凭据，切下个凭据 retry",
+                    "{} API 请求触发 429，本轮 retry 跳过此凭据",
                     api_type
                 );
                 last_error = Some(anyhow::anyhow!(
@@ -825,6 +904,7 @@ impl KiroProvider {
                     status,
                     body
                 ));
+                failed_ids.push(ctx.id);
                 continue;
             }
 
@@ -856,6 +936,8 @@ impl KiroProvider {
                     status,
                     body
                 ));
+                // P0#1：5xx 瞬态错误也 push，避免连续撞同一个上游路径
+                failed_ids.push(ctx.id);
                 if attempt + 1 < max_retries {
                     sleep(Self::retry_delay(attempt)).await;
                 }
@@ -867,7 +949,7 @@ impl KiroProvider {
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
-            // 兜底：当作可重试的瞬态错误处理（不切换凭据）
+            // 兜底：当作可重试的瞬态错误处理
             tracing::warn!(
                 "API 请求失败（未知错误，尝试 {}/{}）: {} {}",
                 attempt + 1,
@@ -881,6 +963,8 @@ impl KiroProvider {
                 status,
                 body
             ));
+            // P0#1：兜底也切换凭据，避免未知错误反复撞同一个
+            failed_ids.push(ctx.id);
             if attempt + 1 < max_retries {
                 sleep(Self::retry_delay(attempt)).await;
             }
