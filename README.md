@@ -2,6 +2,23 @@
 
 一个用 Rust 编写的 Anthropic Claude API 兼容代理服务，将 Anthropic API 请求转换为 Kiro API 请求。
 
+> **本仓库是 [hank9999/kiro.rs](https://github.com/hank9999/kiro.rs) 的 fork**，主要在原项目基础上修复了几个跑久了才暴露的负载均衡 / 缓存问题。详见下方 [Fork 与上游区别](#fork-与上游区别)。
+
+---
+
+## Fork 与上游区别
+
+相对 [hank9999/kiro.rs v1.1.30](https://github.com/hank9999/kiro.rs) 的主要改动：
+
+- **P0#1 retry 不再撞同一个凭据**：原版 affinity 短路会让失败凭据被反复选回（实测 100 burst 切换率 0%）。Fork 在 retry 链路加 `exclude_ids` 强制跳过上次失败凭据。
+- **P0#2 新凭据「雷暴防护」**：新凭据加入时 `recent_usage=0`，LB 立刻判它为「最少使用」→ 1 秒内被打 47 次 429。Fork 用现有凭据 `recent_usage` 中位数作 baseline。
+- **P0#3 周期 balance 刷新**：原版实测 24h 0 条 balance refresh log，cache 完全是启动时快照。Fork 加 10 分钟周期刷新 + 余额不足主动禁用。
+- **P0#4 cache_tracker TTL 对齐上游**：原版命中时刷新 `expires_at`，但 Anthropic 真实 TTL 从首次写入算。Fork 修复后 `cache_read` 数字与上游真实命中率一致。
+- **credentialRpm: 0 真禁用本地限流**：原版 `0` 会落回默认 1-2 秒间隔 + 每日 500 上限（与字面意思相反）。Fork 让 `0` 真的跳过所有本地限流检查。
+- **CI 简化**：删除 Linux/macOS/Windows 二进制 release workflow，仅保留 Docker Hub 自动构建（push tag `v*` 触发）。
+
+镜像：`mjyuan/kiro-rs:latest`（不含本次修复的请用上游镜像 `ghcr.io/hank9999/kiro-rs:latest`）。
+
 ---
 
 ## 免责声明
@@ -34,6 +51,7 @@
 
 ---
 
+- [Fork 与上游区别](#fork-与上游区别)
 - [开始](#开始)
   - [1. 编译](#1-编译)
   - [2. 最小配置](#2-最小配置)
@@ -154,10 +172,31 @@ curl http://127.0.0.1:8990/v1/messages \
 
 ### Docker
 
-也可以通过 Docker 启动：
+**使用预构建镜像（推荐）**
+
+本 fork 的镜像发布在 Docker Hub：
 
 ```bash
-docker-compose up
+docker pull mjyuan/kiro-rs:latest
+# 或指定版本
+docker pull mjyuan/kiro-rs:v1.1.31
+```
+
+支持 `linux/amd64` 和 `linux/arm64` 双架构，每次 push tag `v*` 时由 GitHub Actions 自动构建。
+
+**docker-compose 方式**
+
+```bash
+# 准备 config/config.json 和 config/credentials.json
+docker compose up -d
+```
+
+> 注意：仓库自带的 `docker-compose.yml` 默认拉取 `ghcr.io/hank9999/kiro-rs:latest`（**不含本 fork 的修复**）。要用 fork 版镜像，把 `image:` 改为 `mjyuan/kiro-rs:latest`，或改用 `build: .` 本地构建。
+
+**本地构建**
+
+```bash
+docker compose up -d --build
 ```
 
 需要将 `config.json` 和 `credentials.json` 挂载到容器中，具体参见 `docker-compose.yml`。
@@ -523,8 +562,10 @@ MIT
 
 ## 致谢
 
-本项目的实现离不开前辈的努力:  
+本 fork 在 [hank9999/kiro.rs](https://github.com/hank9999/kiro.rs) 的基础上做了若干负载均衡与缓存修复，地基由原作者打就，向原作者致敬。
+
+原项目的实现也离不开前辈的努力:
  - [kiro2api](https://github.com/caidaoli/kiro2api)
  - [proxycast](https://github.com/aiclientproxy/proxycast)
 
-本项目部分逻辑参考了以上的项目, 再次由衷的感谢!
+部分逻辑参考了以上项目, 再次由衷的感谢!
