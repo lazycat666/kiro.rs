@@ -569,3 +569,7 @@ MIT
  - [proxycast](https://github.com/aiclientproxy/proxycast)
 
 部分逻辑参考了以上项目, 再次由衷的感谢!
+
+## 友情链接
+
+本项目在 [LINUX DO](https://linux.do) 公益推广，[LINUX DO](https://linux.do) 是一个真诚、友善、团结、专业的新型综合性社区，欢迎来玩。
